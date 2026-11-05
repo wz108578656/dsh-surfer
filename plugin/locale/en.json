@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Surfer waveforms",
+    "description": "Open .vcd, .fst, and .ghw files in the right sidebar with the Surfer waveform viewer."
+  }
+}

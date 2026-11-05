@@ -1,0 +1,19 @@
+{
+  "name": "dsh-surfer-repo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "dsh-surfer 仓库级脚本；可安装的 DSH bundle 在 plugin/ 目录",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node scripts/selftest.mjs"
+  },
+  "author": "zhuo.wang (wz108578656)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wz108578656/dsh-surfer.git"
+  }
+}
