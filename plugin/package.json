@@ -1,6 +1,6 @@
 {
   "name": "dsh-surfer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "在 DSH 右侧栏用 Surfer WASM 打开 .vcd / .fst / .ghw 波形文件",
   "author": "zhuo.wang (wz108578656)",
   "homepage": "https://github.com/wz108578656/dsh-surfer#readme",

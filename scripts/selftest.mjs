@@ -38,6 +38,9 @@ assert(client.includes('export function apply') === false, 'host export stays ou
 assert(client.includes("priority: 'extension'"), 'extension priority');
 assert(client.includes("'*.vcd'") && client.includes("'*.fst'") && client.includes("'*.ghw'"), 'patterns');
 assert(client.includes('workspaceFiles.readBytes'), 'byte read');
+assert(client.includes('range: { offset, length }'), 'ranged read');
+assert(client.includes('const CHUNK_BYTES = 2 * 1024 * 1024'), 'chunk size');
+assert(client.includes('const MAX_BYTES = 512 * 1024 * 1024'), 'memory cap');
 assert(client.includes("command: 'LoadUrl'"), 'surfer load');
 assert(client.includes('surfer-ready'), 'ready handshake');
 assert(client.includes("scope === 'session'"), 'session-only open');

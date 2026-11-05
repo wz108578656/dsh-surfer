@@ -1,12 +1,14 @@
 /**
  * dsh-surfer browser half: open .vcd / .fst / .ghw in the right sidebar.
  *
- * Bytes come from workspaceFiles.readBytes (complete-file cap is the Host
- * default, 32 MiB). Surfer WASM is not vendored: a same-origin srcdoc iframe
- * imports surfer.js, surfer_bg.wasm, and integration.js from the public Surfer
- * site, then receives the waveform as a blob: URL via LoadUrl. A cross-origin
- * iframe cannot read a blob URL created by this page, so the official site is
- * not embedded directly.
+ * Bytes come from workspaceFiles.readBytes in 2 MiB windows. A window is not
+ * subject to the 32 MiB complete-file cap, so a large VCD can be assembled in
+ * the browser. The assembled Blob is still kept in memory; files above
+ * MAX_BYTES (512 MiB) are refused before the read starts. Surfer WASM is not
+ * vendored: a same-origin srcdoc iframe imports surfer.js, surfer_bg.wasm, and
+ * integration.js from the public Surfer site, then receives the waveform as a
+ * blob: URL via LoadUrl. A cross-origin iframe cannot read a blob URL created
+ * by this page, so the official site is not embedded directly.
  *
  * Profile-installed bundles are served as browser modules. This file only
  * registers a lazy factory; tab registration happens when the factory runs.
@@ -21,7 +23,10 @@ window.__ModuleLoader__.load({
 		const KIND = 'surfer-wave';
 		const NS = 'surfer';
 		const ASSET_ORIGIN = 'https://app.surfer-project.org';
-		const MAX_BYTES = 32 * 1024 * 1024;
+		/** One readBytes range. Matches the Host default maxBytes; a longer window is refused. */
+		const CHUNK_BYTES = 2 * 1024 * 1024;
+		/** Largest waveform kept in the tab. The whole file is copied into a Blob for Surfer. */
+		const MAX_BYTES = 512 * 1024 * 1024;
 		const FILE_ADDRESS_PREFIX = 'dsh-resource://file/';
 
 		const zh = {
@@ -29,6 +34,7 @@ window.__ModuleLoader__.load({
 			'loading': '正在读取波形…',
 			'booting': '正在加载 Surfer…',
 			'tooLarge': '文件超过 {limit}，无法在侧栏打开',
+			'reading': '正在读取波形… {read} / {total}',
 			'unavailable': '读不到这个文件',
 			'notSession': '只能打开当前会话工作区里的波形文件',
 			'cdn': '加载 Surfer 失败。检查能否访问 {origin}',
@@ -43,6 +49,7 @@ window.__ModuleLoader__.load({
 			'loading': 'Reading waveform…',
 			'booting': 'Loading Surfer…',
 			'tooLarge': 'File is larger than {limit} and cannot open in the sidebar',
+			'reading': 'Reading waveform… {read} / {total}',
 			'unavailable': 'Cannot read this file',
 			'notSession': 'Only waveform files in this session workspace can be opened',
 			'cdn': 'Surfer failed to load. Check access to {origin}',
@@ -87,6 +94,45 @@ window.__ModuleLoader__.load({
 			} catch {
 				return undefined;
 			}
+		}
+
+		/**
+		 * Read a whole regular file as ranged windows. Returns the file size and
+		 * one copy of its bytes, or `{ tooLarge: true }` when the size is known
+		 * and above the cap. A short chunk ends the file; `eof` is trusted when
+		 * the Host reports it.
+		 */
+		async function readWaveBytes(readRange, sessionId, path, signal, onProgress) {
+			const parts = [];
+			let offset = 0;
+			let total = 0;
+			let size;
+			for (;;) {
+				const result = await readRange(sessionId, path, offset, CHUNK_BYTES, signal);
+				if (!result.ok) return { ok: false, error: result.error };
+				const page = result.value;
+				if (size === undefined && typeof page.bytes === 'number' && page.bytes >= 0) size = page.bytes;
+				if (size !== undefined && size > MAX_BYTES) return { ok: false, tooLarge: true, bytes: size };
+				const data = page.data;
+				if (data.byteLength > 0) {
+					const copy = new Uint8Array(data.byteLength);
+					copy.set(data);
+					parts.push(copy);
+					total += copy.byteLength;
+					if (total > MAX_BYTES) return { ok: false, tooLarge: true, bytes: size ?? total };
+				}
+				offset += data.byteLength;
+				if (onProgress) onProgress(total, size);
+				if (page.eof || data.byteLength === 0) break;
+				if (size !== undefined && offset >= size) break;
+			}
+			const body = new Uint8Array(total);
+			let cursor = 0;
+			for (const part of parts) {
+				body.set(part, cursor);
+				cursor += part.byteLength;
+			}
+			return { ok: true, data: body, bytes: total };
 		}
 
 		function fileNameOf(path) {
@@ -179,15 +225,18 @@ window.__ModuleLoader__.load({
 			}, link.label) : null);
 		}
 
-		function WaveBody({ useTabInfo, sessionId, t, readBytes }) {
+		function WaveBody({ useTabInfo, sessionId, t, readRange }) {
 			const { tab } = useTabInfo();
 			const address = tab.address;
 			const signal = tab.signal;
 			const [phase, setPhase] = React.useState('loading');
+			const [progress, setProgress] = React.useState('');
 			const [detail, setDetail] = React.useState('');
 			const [attempt, setAttempt] = React.useState(0);
 			const frameRef = React.useRef(null);
 			const blobRef = React.useRef('');
+			const tRef = React.useRef(t);
+			tRef.current = t;
 
 			const parsed = parseFileAddress(address);
 			const file = parsed?.scope === 'session' ? parsed : null;
@@ -202,6 +251,7 @@ window.__ModuleLoader__.load({
 				let cancelled = false;
 				let blobUrl = '';
 				setPhase('loading');
+				setProgress('');
 				setDetail('');
 
 				const fail = (next, message) => {
@@ -230,25 +280,27 @@ window.__ModuleLoader__.load({
 				(async () => {
 					let result;
 					try {
-						result = await readBytes(sessionId, filePath, controller.signal);
+						result = await readWaveBytes(readRange, sessionId, filePath, controller.signal, (read, total) => {
+							if (!cancelled) setProgress(tRef.current('reading', {
+								read: formatBytes(read),
+								total: typeof total === 'number' ? formatBytes(total) : '…',
+							}));
+						});
 					} catch (error) {
 						if (!controller.signal.aborted) fail('unavailable', error && error.message);
 						return;
 					}
 					if (cancelled || controller.signal.aborted) return;
 					if (!result.ok) {
-						if (result.error && result.error.code === 'workspace-file/too-large') fail('tooLarge');
+						if (result.tooLarge || (result.error && result.error.code === 'workspace-file/too-large')) fail('tooLarge');
 						else fail('unavailable', result.error && result.error.message);
 						return;
 					}
-					const bytes = result.value.bytes;
-					if (bytes > MAX_BYTES) {
+					if (result.bytes > MAX_BYTES) {
 						fail('tooLarge');
 						return;
 					}
-					const copy = new Uint8Array(result.value.data.byteLength);
-					copy.set(result.value.data);
-					blobUrl = URL.createObjectURL(new Blob([copy], { type: 'application/octet-stream' }));
+					blobUrl = URL.createObjectURL(new Blob([result.data], { type: 'application/octet-stream' }));
 					blobRef.current = blobUrl;
 					if (!cancelled) setPhase('booting');
 				})();
@@ -261,7 +313,7 @@ window.__ModuleLoader__.load({
 					if (blobUrl) URL.revokeObjectURL(blobUrl);
 					if (blobRef.current === blobUrl) blobRef.current = '';
 				};
-			}, [filePath, sessionId, attempt, signal, readBytes]);
+			}, [filePath, sessionId, attempt, signal, readRange]);
 
 			const retry = () => setAttempt((value) => value + 1);
 			const site = { href: ASSET_ORIGIN, label: t('openSite') };
@@ -297,7 +349,7 @@ window.__ModuleLoader__.load({
 						fontSize: '13px',
 						pointerEvents: 'none',
 					},
-				}, phase === 'booting' ? t('booting') : t('loading')) : null,
+				}, phase === 'booting' ? t('booting') : (progress || t('loading'))) : null,
 				phase === 'ready' ? h('button', {
 					type: 'button',
 					onClick: retry,
@@ -336,7 +388,12 @@ window.__ModuleLoader__.load({
 			apply(ctx) {
 				ctx.effect(() => ctx.locale.register(NS, { zh, en }));
 				const translate = ctx.locale.bind(NS);
-				const readBytes = (sessionId, path, signal) => ctx.remote.workspaceFiles.readBytes(sessionId, path, {}, signal);
+				const readRange = (sessionId, path, offset, length, signal) => ctx.remote.workspaceFiles.readBytes(
+					sessionId,
+					path,
+					{ range: { offset, length } },
+					signal,
+				);
 				ctx.effect(() => ctx.sidebarRightTabs.register({
 					id: ID,
 					kind: KIND,
@@ -353,7 +410,7 @@ window.__ModuleLoader__.load({
 					name: 'sidebar.right.pane.tab',
 					key: ID,
 					locale: NS,
-					inject: () => ({ readBytes }),
+					inject: () => ({ readRange }),
 				}, WaveBody)));
 				ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register({
 					name: 'sidebar.right.pane.tab.title',
