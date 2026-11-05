@@ -140,6 +140,19 @@ window.__ModuleLoader__.load({
 			return slash === -1 ? path : path.slice(slash + 1);
 		}
 
+		/**
+		 * The file address a tab body actually receives. The committed record keeps
+		 * it on `contentId`; `address` is not a field of that record. Older callers
+		 * and the title hook may still pass `navigation.address`, which is the same
+		 * string, so both are accepted.
+		 */
+		function tabAddress(tab) {
+			if (tab && typeof tab.contentId === 'string' && tab.contentId) return tab.contentId;
+			if (tab && tab.navigation && typeof tab.navigation.address === 'string') return tab.navigation.address;
+			if (tab && typeof tab.address === 'string') return tab.address;
+			return '';
+		}
+
 		function isWaveform(address) {
 			const parsed = parseFileAddress(address);
 			return parsed?.scope === 'session' && /\.(vcd|fst|ghw)$/i.test(parsed.path);
@@ -227,7 +240,7 @@ window.__ModuleLoader__.load({
 
 		function WaveBody({ useTabInfo, sessionId, t, readRange }) {
 			const { tab } = useTabInfo();
-			const address = tab.address;
+			const address = tabAddress(tab);
 			const signal = tab.signal;
 			const [phase, setPhase] = React.useState('loading');
 			const [progress, setProgress] = React.useState('');
@@ -378,7 +391,7 @@ window.__ModuleLoader__.load({
 
 		function WaveTitle({ useTabInfo, t }) {
 			const { tab } = useTabInfo();
-			const parsed = parseFileAddress(tab.address);
+			const parsed = parseFileAddress(tabAddress(tab));
 			const name = parsed?.path ? fileNameOf(parsed.path) : t('title');
 			return h('span', null, name);
 		}
@@ -415,6 +428,7 @@ window.__ModuleLoader__.load({
 				ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab.title', () => ctx.slots.register({
 					name: 'sidebar.right.pane.tab.title',
 					key: ID,
+					locale: NS,
 				}, WaveTitle)));
 			},
 		};

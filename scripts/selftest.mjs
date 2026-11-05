@@ -44,6 +44,8 @@ assert(client.includes('const MAX_BYTES = 512 * 1024 * 1024'), 'memory cap');
 assert(client.includes("command: 'LoadUrl'"), 'surfer load');
 assert(client.includes('surfer-ready'), 'ready handshake');
 assert(client.includes("scope === 'session'"), 'session-only open');
+assert(client.includes('tab.contentId'), 'tab address is contentId');
+assert(client.includes('function tabAddress'), 'address reader');
 
 const host = read('../plugin/index.js');
 assert(/export function apply\(/.test(host), 'host apply');
