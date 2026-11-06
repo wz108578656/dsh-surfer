@@ -3,7 +3,7 @@
 # The Host half does not read files. The Client half registers an
 # extension-priority file tab and loads https://app.surfer-project.org assets
 # inside a same-origin iframe. There is no Host config: the asset origin,
-# the 2 MiB read window, and the 512 MiB in-memory cap are fixed in the client.
+# the 2 MiB read window, the 8-way parallel read, and the 512 MiB cap are fixed in the client.
 - insert:
     - id: surfer
       name: dsh-surfer

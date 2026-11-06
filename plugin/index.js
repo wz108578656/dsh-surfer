@@ -1,2 +1,2 @@
-/** Host half of dsh-surfer. Waveform bytes are read in the browser, 2 MiB at a time, through workspaceFiles.readBytes. */
+/** Host half of dsh-surfer. The browser reads waveform bytes through workspaceFiles.readBytes, 2 MiB per window and several windows at once. */
 export function apply() {}

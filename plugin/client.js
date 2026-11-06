@@ -1,9 +1,10 @@
 /**
  * dsh-surfer browser half: open .vcd / .fst / .ghw in the right sidebar.
  *
- * Bytes come from workspaceFiles.readBytes in 2 MiB windows. A window is not
- * subject to the 32 MiB complete-file cap, so a large VCD can be assembled in
- * the browser. The assembled Blob is still kept in memory; files above
+ * Bytes come from workspaceFiles.readBytes in 2 MiB windows. The Host refuses
+ * a longer window, so throughput comes from reading READ_PARALLEL windows at
+ * once. A window is not subject to the 32 MiB complete-file cap, so a large
+ * VCD can be assembled in the browser. The assembled Blob stays in memory; files above
  * MAX_BYTES (512 MiB) are refused before the read starts. Surfer WASM is not
  * vendored: a same-origin srcdoc iframe imports surfer.js, surfer_bg.wasm, and
  * integration.js from the public Surfer site, then receives the waveform as a
@@ -23,8 +24,10 @@ window.__ModuleLoader__.load({
 		const KIND = 'surfer-wave';
 		const NS = 'surfer';
 		const ASSET_ORIGIN = 'https://app.surfer-project.org';
-		/** One readBytes range. Matches the Host default maxBytes; a longer window is refused. */
+		/** One readBytes range. Matches the Host default maxBytes; a longer window is refused, not shortened. */
 		const CHUNK_BYTES = 2 * 1024 * 1024;
+		/** Ranges in flight after the first. The Host caps one window, not how many windows overlap. */
+		const READ_PARALLEL = 8;
 		/** Largest waveform kept in the tab. The whole file is copied into a Blob for Surfer. */
 		const MAX_BYTES = 512 * 1024 * 1024;
 		const FILE_ADDRESS_PREFIX = 'dsh-resource://file/';
@@ -96,39 +99,121 @@ window.__ModuleLoader__.load({
 			}
 		}
 
+		/** Copy one window. The Remote buffer can be reused, so the caller owns this copy. */
+		function copyBytes(data) {
+			const copy = new Uint8Array(data.byteLength);
+			copy.set(data);
+			return copy;
+		}
+
 		/**
-		 * Read a whole regular file as ranged windows. Returns the file size and
-		 * one copy of its bytes, or `{ tooLarge: true }` when the size is known
-		 * and above the cap. A short chunk ends the file; `eof` is trusted when
-		 * the Host reports it.
+		 * Read one window and keep its place. A short or empty window ends the
+		 * file; later planned windows are then discarded by the caller.
+		 */
+		async function readChunk(readRange, sessionId, path, offset, signal) {
+			const result = await readRange(sessionId, path, offset, CHUNK_BYTES, signal);
+			if (!result.ok) return { ok: false, offset, error: result.error };
+			const page = result.value;
+			return {
+				ok: true,
+				offset,
+				data: copyBytes(page.data),
+				size: typeof page.bytes === 'number' && page.bytes >= 0 ? page.bytes : undefined,
+				eof: page.eof === true || page.data.byteLength < CHUNK_BYTES,
+			};
+		}
+
+		/**
+		 * Read a whole regular file as ranged windows. The first window learns
+		 * the size, then up to READ_PARALLEL windows fly at once. Returns one
+		 * copy of the bytes, or `{ tooLarge: true }` when the size is known and
+		 * above the cap. A short chunk ends the file; `eof` is trusted when the
+		 * Host reports it.
 		 */
 		async function readWaveBytes(readRange, sessionId, path, signal, onProgress) {
-			const parts = [];
-			let offset = 0;
-			let total = 0;
-			let size;
-			for (;;) {
-				const result = await readRange(sessionId, path, offset, CHUNK_BYTES, signal);
-				if (!result.ok) return { ok: false, error: result.error };
-				const page = result.value;
-				if (size === undefined && typeof page.bytes === 'number' && page.bytes >= 0) size = page.bytes;
-				if (size !== undefined && size > MAX_BYTES) return { ok: false, tooLarge: true, bytes: size };
-				const data = page.data;
-				if (data.byteLength > 0) {
-					const copy = new Uint8Array(data.byteLength);
-					copy.set(data);
-					parts.push(copy);
-					total += copy.byteLength;
-					if (total > MAX_BYTES) return { ok: false, tooLarge: true, bytes: size ?? total };
-				}
-				offset += data.byteLength;
-				if (onProgress) onProgress(total, size);
-				if (page.eof || data.byteLength === 0) break;
-				if (size !== undefined && offset >= size) break;
+			const first = await readChunk(readRange, sessionId, path, 0, signal);
+			if (!first.ok) return { ok: false, error: first.error };
+			if (first.size !== undefined && first.size > MAX_BYTES) return { ok: false, tooLarge: true, bytes: first.size };
+			if (first.eof || first.data.byteLength === 0) {
+				if (onProgress) onProgress(first.data.byteLength, first.size);
+				return { ok: true, data: first.data, bytes: first.data.byteLength };
 			}
+
+			const parts = [first.data];
+			let received = first.data.byteLength;
+			const known = first.size;
+			const expected = known === undefined ? undefined : Math.ceil(known / CHUNK_BYTES);
+			let next = 1;
+			let fatal;
+
+			const take = async (index) => {
+				const chunk = await readChunk(readRange, sessionId, path, index * CHUNK_BYTES, signal);
+				if (!chunk.ok) {
+					fatal = chunk.error;
+					return;
+				}
+				if (chunk.data.byteLength > 0) parts[index] = chunk.data;
+				received += chunk.data.byteLength;
+				if (received > MAX_BYTES) fatal = { tooLarge: true, bytes: known ?? received };
+				if (onProgress && !fatal) onProgress(received, known);
+			};
+
+			const inflight = new Set();
+			const launch = () => {
+				if (fatal || signal.aborted) return;
+				if (expected !== undefined && next >= expected) return;
+				const job = take(next);
+				next += 1;
+				inflight.add(job);
+				job.then(() => {
+					inflight.delete(job);
+				}, () => {
+					inflight.delete(job);
+				});
+			};
+			/**
+			 * A short window ends the file only once every window before it has
+			 * arrived. An earlier hole means the end is not known yet.
+			 */
+			const ended = () => {
+				if (expected !== undefined) return false;
+				for (let index = 1; index < parts.length; index += 1) {
+					const part = parts[index];
+					if (!part) return false;
+					if (part.byteLength < CHUNK_BYTES) return true;
+				}
+				return false;
+			};
+
+			while (!fatal && !signal.aborted && (expected === undefined || next < expected || inflight.size > 0)) {
+				while (!fatal && !ended() && inflight.size < READ_PARALLEL && (expected === undefined || next < expected)) launch();
+				if (inflight.size === 0) break;
+				await Promise.race(inflight);
+			}
+			if (fatal) {
+				await Promise.allSettled(inflight);
+				if (fatal.tooLarge) return { ok: false, tooLarge: true, bytes: fatal.bytes };
+				return { ok: false, error: fatal };
+			}
+			if (signal.aborted) {
+				await Promise.allSettled(inflight);
+				return { ok: false, error: { code: 'aborted', message: 'aborted' } };
+			}
+			await Promise.all(inflight);
+
+			const kept = [];
+			let total = 0;
+			for (let index = 0; index < parts.length; index += 1) {
+				const part = parts[index];
+				if (!part) return { ok: false, error: { code: 'workspace-file/incomplete', message: 'a byte window did not arrive' } };
+				kept.push(part);
+				total += part.byteLength;
+				if (part.byteLength < CHUNK_BYTES) break;
+			}
+			if (total > MAX_BYTES) return { ok: false, tooLarge: true, bytes: known ?? total };
 			const body = new Uint8Array(total);
 			let cursor = 0;
-			for (const part of parts) {
+			for (const part of kept) {
 				body.set(part, cursor);
 				cursor += part.byteLength;
 			}
@@ -411,6 +496,9 @@ window.__ModuleLoader__.load({
 					id: ID,
 					kind: KIND,
 					multiple: true,
+					// A hidden Surfer tab keeps its iframe, WASM, and blob. Remounting
+					// would reread the file and reboot the viewer.
+					keepMounted: true,
 					patterns: ['*.vcd', '*.fst', '*.ghw'],
 					priority: 'extension',
 					canOpen: isWaveform,
